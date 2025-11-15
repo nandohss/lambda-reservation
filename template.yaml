@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  CoworkingSpacesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: coworking_spaces.coworking_spaces.add_coworking_space  # Handler completo com caminho
+      Runtime: python3.8
+      Environment:
+        Variables:
+          TABLE_NAME: CoworkingSpaces
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: CoworkingSpaces
+      Events:
+        CoworkingSpacesApi:
+          Type: Api
+          Properties:
+            Path: /spaces
+            Method: any
+
+  ReservationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: reservations.reservations.add_reservation  # Handler completo com caminho
+      Runtime: python3.8
+      Environment:
+        Variables:
+          RESERVATIONS_TABLE_NAME: Reservations
+          USERS_TABLE_NAME: Users
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: Reservations
+        - DynamoDBCrudPolicy:
+            TableName: Users
+      Events:
+        ReservationsApi:
+          Type: Api
+          Properties:
+            Path: /reservations
+            Method: any
