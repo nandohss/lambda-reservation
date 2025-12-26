@@ -42,7 +42,7 @@ def add_reservation(event, context):
         user_id = body['userId']
         date_reservation = body['date_reservation']
         hours = body['hours_reservation']
-        status = body.get('status', 'reserved')
+        status = body.get('status', 'PENDING')
         created_at = datetime.utcnow().isoformat() + 'Z'
 
         if not space_exists_and_available(space_id):
