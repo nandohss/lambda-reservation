@@ -1,8 +1,8 @@
 import json
 import decimal  # para usar decimal.Decimal no decimal_default
-from datetime import datetime
+from datetime import datetime, timedelta
 import boto3
-from boto3.dynamodb.conditions import Attr
+from boto3.dynamodb.conditions import Attr, Key
 
 dynamodb = boto3.resource('dynamodb', region_name='sa-east-1')
 reservations_table = dynamodb.Table('reservation')
@@ -11,10 +11,33 @@ users_table = dynamodb.Table('users')
 
 
 def decimal_default(obj):
-    # Corrigido: usa o módulo 'decimal' importado acima
     if isinstance(obj, decimal.Decimal):
         return float(obj)
     raise TypeError(f'Type {type(obj)} not serializable')
+
+
+def safe_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        # Handle Decimal
+        if isinstance(value, decimal.Decimal):
+            return int(value)
+        # Handle String
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, decimal.Decimal):
+            return float(value)
+        return float(value)
+    except (ValueError, TypeError):
+        return default
 
 
 def user_exists(user_id):
@@ -34,16 +57,18 @@ def space_exists_and_available(space_id):
         return False
 
 
+
 def add_reservation(event, context):
     try:
         body = json.loads(event['body'])
+        print(f"DEBUG: add_reservation BODY: {body}")
 
         space_id = body['spaceId_reservation']
         user_id = body['userId']
         date_reservation = body['date_reservation']
         hours = body['hours_reservation']
         status = body.get('status', 'PENDING')
-        created_at = datetime.utcnow().isoformat() + 'Z'
+        created_at = (datetime.utcnow() - timedelta(hours=3)).isoformat(timespec='seconds') + '-03:00'
 
         if not space_exists_and_available(space_id):
             print(f"Espaço não encontrado ou não disponível: {space_id}")
@@ -61,7 +86,7 @@ def add_reservation(event, context):
 
         for hour in hours:
             try:
-                datetime_reservation = f"{date_reservation}T{int(hour):02d}:00:00Z"
+                datetime_reservation = f"{date_reservation}T{int(hour):02d}:00:00-03:00"
 
                 # Tentativa de inserção condicional
                 reservations_table.put_item(
@@ -72,7 +97,8 @@ def add_reservation(event, context):
                         'status': status,
                         'date_reservation': date_reservation,
                         'hour_reservation': str(hour),
-                        'created_at': created_at
+                        'created_at': created_at,
+                        'updated_at': created_at
                     },
                     ConditionExpression='attribute_not_exists(spaceId_reservation) AND attribute_not_exists(datetime_reservation)'
                 )
@@ -80,7 +106,7 @@ def add_reservation(event, context):
                 print(f"✅ Reserva adicionada com sucesso: {datetime_reservation}")
 
             except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
-                print(f"⚠️ Horário já reservado (conflito de escrita): {datetime_reservation}")
+                print(f"⚠️ Horário já reservado (conflito de escrita): Space={space_id} DateTime={datetime_reservation}")
                 return {
                     'statusCode': 400,
                     'body': json.dumps({'message': f'Horário {hour}h já reservado'})
@@ -141,7 +167,7 @@ def check_availability(event, context):
     conflicts = []
 
     for hour in hours:
-        datetime_str = f"{date}T{int(hour):02d}:00:00Z"
+        datetime_str = f"{date}T{int(hour):02d}:00:00-03:00"
 
         response = reservations_table.get_item(
             Key={
@@ -178,7 +204,7 @@ def cancel_reservation(event, context):
     if not space_id_reservation or not datetime_reservation or not user_id:
         return {
             'statusCode': 400,
-            'body': json.dumps({'message': 'Parâmetros obrigatórios ausentes'})  # mensagem consistente
+            'body': json.dumps({'message': 'Parâmetros obrigatórios ausentes'})
         }
 
     response = reservations_table.get_item(
@@ -242,8 +268,37 @@ def listar_reservas_usuario(event, context):
         }
 
 
+def batch_get_users(user_ids):
+    if not user_ids:
+        return {}
+    
+    user_map = {}
+    id_list = list(user_ids)
+    
+    # Chunking 100 items (DynamoDB limit)
+    for i in range(0, len(id_list), 100):
+        chunk = id_list[i:i+100]
+        keys = [{'userId': uid} for uid in chunk]
+        
+        try:
+            response = dynamodb.batch_get_item(
+                RequestItems={
+                    users_table.name: {
+                        'Keys': keys
+                    }
+                }
+            )
+            
+            for item in response.get('Responses', {}).get(users_table.name, []):
+                user_map[item['userId']] = item
+                
+        except Exception as e:
+            print(f"⚠️ Erro no batch_get_users chunk: {e}")
+            
+    return user_map
+
+
 def listar_reservas_cohoster(event, context):
-    # Aceita hosterId (preferencial) e coHosterId por compatibilidade
     params = event.get('queryStringParameters') or {}
     hoster_id = params.get('hosterId') or params.get('coHosterId')
 
@@ -254,56 +309,109 @@ def listar_reservas_cohoster(event, context):
         }
 
     try:
-        # 1) Buscar todos os espaços cujo campo 'hoster' == hoster_id
+        print(f"DEBUG: Iniciando busca otimizada para hoster_id={hoster_id}")
+        
+        # 1) Buscar todos os espaços
         spaces_resp = coworking_table.scan(
             FilterExpression=Attr("hoster").eq(hoster_id)
         )
         spaces = spaces_resp.get('Items', [])
-        print(f"Hoster {hoster_id} tem {len(spaces)} espacos.")
+        print(f"DEBUG: Encontrados {len(spaces)} espaços.")
 
-        # (Opcional) Filtro por status, se vier na query
-        status_filter = params.get('status')  # ex.: 'CONFIRMED', 'PENDING', 'CANCELED', 'REFUSED', 'reserved'
+        status_filter = params.get('status') 
+        
+        all_res_metrics = []
+        unique_user_ids = set()
 
-        # 2) Para cada espaço, buscar reservas na tabela 'reservation'
-        normalized = []
+        # 2) Coletar reservas de todos os espaços (usando Query)
         for space in spaces:
-            sid = space['spaceId']
-            space_name = space.get('name', '—')
+            try:
+                sid = space['spaceId']
+                
+                key_expr = Key("spaceId_reservation").eq(sid)
+                query_args = {'KeyConditionExpression': key_expr}
+                
+                if status_filter:
+                    query_args['FilterExpression'] = Attr("status").eq(status_filter)
 
-            filter_expr = Attr("spaceId_reservation").eq(sid)
-            if status_filter:
-                filter_expr = filter_expr & Attr("status").eq(status_filter)
+                res_resp = reservations_table.query(**query_args)
+                items = res_resp.get('Items', [])
+                
+                for r in items:
+                    all_res_metrics.append((space, r))
+                    if r.get('userId'):
+                        unique_user_ids.add(r.get('userId'))
+                        
+            except Exception as e_space:
+                print(f"❌ Erro ao buscar reservas do espaço {space.get('spaceId')}: {e_space}")
+                continue
 
-            res_resp = reservations_table.scan(
-                FilterExpression=filter_expr
-            )
+        print(f"DEBUG: Buscando detalhes de {len(unique_user_ids)} usuários.")
+        user_map = batch_get_users(unique_user_ids)
 
-            for reserva in res_resp.get('Items', []):
-                # Enriquecimento de usuário
+        normalized = []
+        for space, reserva in all_res_metrics:
+            try:
                 user_id = reserva.get('userId')
-                user_resp = users_table.get_item(Key={'userId': user_id})
-                user_item = user_resp.get('Item', {})
-
-                # Campos originais
+                user_item = user_map.get(user_id, {})
+                
                 space_id_res = reserva.get('spaceId_reservation')
                 dt_res = reserva.get('datetime_reservation')
                 status = reserva.get('status')
+                
+                # --- Lógica de Auto-Recusa
+                if status == 'PENDING' and dt_res:
+                    try:
+                        now_iso = datetime.utcnow().isoformat() + 'Z'
+                        if dt_res < now_iso:
+                            updated_at = (datetime.utcnow() - timedelta(hours=3)).isoformat(timespec='seconds') + '-03:00'
+                            reservations_table.update_item(
+                                Key={'spaceId_reservation': space_id_res, 'datetime_reservation': dt_res},
+                                UpdateExpression="set #st = :val, #ua = :ua_val",
+                                ExpressionAttributeNames={'#st': 'status', '#ua': 'updated_at'},
+                                ExpressionAttributeValues={':val': 'REFUSED', ':ua_val': updated_at}
+                            )
+                            status = 'REFUSED'
+                    except Exception:
+                        pass
 
-                # Mapeia para o DTO do app
+                # --- Cálculo de Data Final ---
+                try:
+                    s_dt = dt_res.replace('Z', '+00:00')
+                    dt_obj = datetime.fromisoformat(s_dt)
+                    end_dt = (dt_obj + timedelta(hours=1)).isoformat(timespec='seconds')
+                except Exception:
+                    end_dt = dt_res
+
+                price_hour = safe_float(space.get('precoHora'), 0.0)
+                is_full_day = space.get('diaInteiro', False)
+                price_day = safe_float(space.get('precoDia'), 0.0)
+
                 item = {
                     "id": f"{space_id_res}|{dt_res}",
                     "spaceId": space_id_res,
                     "userId": user_id,
                     "hosterId": hoster_id,
                     "startDate": dt_res,
-                    "endDate": dt_res,  # sem fim real; repetir startDate
+                    "endDate": end_dt,
+                    "totalValue": price_hour,
+                    "hourlyRate": price_hour,
+                    "dailyRate": price_day,
+                    "isFullDay": is_full_day,
+                    "createdAt": reserva.get('created_at'),
+                    "dateReservation": reserva.get('date_reservation'),
                     "status": status,
-                    "spaceName": space_name,
+                    "spaceName": space.get('name', '—'),
+                    "capacity": safe_int(space.get('capacity')),
                     "userName": user_item.get('name', '—'),
                     "userEmail": user_item.get('email', '—')
                 }
                 normalized.append(item)
+            except Exception as e_item:
+                print(f"❌ Erro ao normalizar item {reserva.get('datetime_reservation')}: {e_item}")
+                continue
 
+        print(f"DEBUG: Retornando {len(normalized)} itens.")
         return {
             'statusCode': 200,
             'body': json.dumps(normalized, default=decimal_default)
@@ -314,4 +422,60 @@ def listar_reservas_cohoster(event, context):
         return {
             'statusCode': 500,
             'body': json.dumps({'message': f'Erro interno: {str(e)}'})
+        }
+
+
+def update_reservation_status(event, context):
+    try:
+        body = json.loads(event['body'])
+    except Exception:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'message': 'JSON inválido no corpo da requisição'})
+        }
+
+    space_id_reservation = body.get('spaceId')
+    datetime_reservation = body.get('datetime')
+    new_status = body.get('status')
+
+    if not space_id_reservation or not datetime_reservation or not new_status:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'message': 'Parâmetros obrigatórios ausentes: spaceId, datetime, status'})
+        }
+
+    valid_statuses = ['PENDING', 'CONFIRMED', 'REFUSED', 'CANCELED']
+    if new_status not in valid_statuses:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'message': f'Status inválido. Permitidos: {valid_statuses}'})
+        }
+
+    try:
+        updated_at = (datetime.utcnow() - timedelta(hours=3)).isoformat(timespec='seconds') + '-03:00'
+        
+        response = reservations_table.update_item(
+            Key={
+                'spaceId_reservation': space_id_reservation,
+                'datetime_reservation': datetime_reservation
+            },
+            UpdateExpression="set #st = :val, #ua = :ua_val",
+            ExpressionAttributeNames={'#st': 'status', '#ua': 'updated_at'},
+            ExpressionAttributeValues={':val': new_status, ':ua_val': updated_at},
+            ReturnValues="UPDATED_NEW"
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': f'Status atualizado para {new_status}',
+                'updatedAttributes': response.get('Attributes')
+            }, default=decimal_default)
+        }
+
+    except Exception as e:
+        print(f"❌ Erro ao atualizar status da reserva: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'message': f'Erro ao atualizar status: {str(e)}'})
         }
